@@ -341,6 +341,13 @@ fn prepare_tools(tools_path: &Path, arch: &str) -> crate::Result<Tools> {
     set_magic(&[0; 3]),
   )?;
 
+  // Older CLIs downloaded the AppImage output plugin next to linuxdeploy, which
+  // then prefers it over its built-in plugin. Remove it so only verified tools run.
+  let legacy_plugin = tools_path.join("linuxdeploy-plugin-appimage.AppImage");
+  if legacy_plugin.exists() {
+    fs::remove_file(&legacy_plugin)?;
+  }
+
   // linuxdeploy's built-in AppImage plugin otherwise downloads the runtime
   // from the rolling `continuous` release.
   let type2_runtime = tools_path.join(format!("runtime-{TYPE2_RUNTIME_RELEASE}-{arch}"));
