@@ -8,7 +8,10 @@ use crate::{
   Settings,
   bundle::settings::Arch,
   error::Context,
-  utils::{CommandExt, fs_utils, http_utils::download},
+  utils::{
+    CommandExt, fs_utils,
+    http_utils::{HashAlgorithm, download_and_verify, verify_hash},
+  },
 };
 use std::{
   fs,
@@ -52,11 +55,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
 
   fs::create_dir_all(&tools_path)?;
 
-  let linuxdeploy_path = prepare_tools(
-    &tools_path,
-    tools_arch,
-    settings.log_level() != log::Level::Error,
-  )?;
+  let tools = prepare_tools(&tools_path, tools_arch)?;
 
   let package_dir = settings.project_out_directory().join("bundle/appimage_deb");
 
@@ -169,8 +168,9 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     _ => "0",
   };
 
-  let mut cmd = Command::new(linuxdeploy_path);
+  let mut cmd = Command::new(&tools.linuxdeploy);
   cmd.env("OUTPUT", &appimage_path);
+  cmd.env("LDAI_RUNTIME_FILE", &tools.type2_runtime);
   cmd.env("ARCH", tools_arch);
   // Looks like the cli arg isn't enough for the updated AppImage output-plugin.
   cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
@@ -204,28 +204,155 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   Ok(vec![appimage_path])
 }
 
-// returns the linuxdeploy path to keep linuxdeploy_arch contained
-fn prepare_tools(tools_path: &Path, arch: &str, verbose: bool) -> crate::Result<PathBuf> {
-  const LINUXDEPLOY_COMMIT_HASH: &str = "07333c6";
+const LINUXDEPLOY_COMMIT_HASH: &str = "07333c6";
+const TYPE2_RUNTIME_RELEASE: &str = "20251108";
 
-  let apprun = tools_path.join(format!("AppRun-{arch}"));
-  if !apprun.exists() {
-    let data = download(&format!(
-      "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-{arch}"
-    ))?;
-    write_and_make_executable(&apprun, &data)?;
+// SHA-256 of each downloaded tool, by `tools_arch`. Update them together with
+// the release they are downloaded from.
+const APPRUN_SHA256: &[(&str, &str)] = &[
+  (
+    "x86_64",
+    "f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f",
+  ),
+  (
+    "i686",
+    "a573a682b1a4a3e9b5dddbd1f5785749b7bba6013149b51ae99d0f123fe11691",
+  ),
+  (
+    "aarch64",
+    "072f17c0895a85c490282fe5395c5007e5fc75da727e553b3b8fb680feb11578",
+  ),
+  (
+    "armhf",
+    "b14d89f0762bcf09fc6af2359d936675928b8833ff52a1aeda68cb28a309f6ba",
+  ),
+];
+const LINUXDEPLOY_SHA256: &[(&str, &str)] = &[
+  (
+    "x86_64",
+    "36a2d7e274d12e1050d0e9ecfe11d339ed54720b2bec464c286d53f8b07f5c62",
+  ),
+  (
+    "i686",
+    "fab919e3f88ec4460631f744ed5205bb7965ab4bc2c276227e12db81543afe9a",
+  ),
+  (
+    "aarch64",
+    "556ab80baa98e600aa80f0dcedfb70bca0e1ce7e9f147fb345be3fcc3e91b2b1",
+  ),
+  (
+    "armhf",
+    "2dad604a3b8110ff81f6f754d6fe1ba50b92bb75303385ab080966edddee28dd",
+  ),
+];
+const TYPE2_RUNTIME_SHA256: &[(&str, &str)] = &[
+  (
+    "x86_64",
+    "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d",
+  ),
+  (
+    "i686",
+    "e72ea0b140a0a16e680713238a6f30aad278b62c4ca17919c554864124515498",
+  ),
+  (
+    "aarch64",
+    "00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444",
+  ),
+  (
+    "armhf",
+    "e9060d37577b8a29914ec12d8740add24e19ff29012fb1fa0f60daf62db0688d",
+  ),
+];
+
+// linuxdeploy's AppImage magic bytes. They are zeroed in our copy so that
+// AppImage integration tools don't pick it up.
+const APPIMAGE_MAGIC_OFFSET: std::ops::Range<usize> = 8..11;
+const APPIMAGE_MAGIC: &[u8] = b"AI\x02";
+
+struct Tools {
+  linuxdeploy: PathBuf,
+  type2_runtime: PathBuf,
+}
+
+/// Returns a function that overwrites linuxdeploy's AppImage magic bytes.
+fn set_magic(magic: &'static [u8]) -> impl Fn(&mut Vec<u8>) {
+  move |data| {
+    if let Some(bytes) = data.get_mut(APPIMAGE_MAGIC_OFFSET) {
+      bytes.copy_from_slice(magic);
+    }
   }
+}
+
+fn sha256_for(table: &[(&'static str, &'static str)], arch: &str) -> crate::Result<&'static str> {
+  table
+    .iter()
+    .find(|(a, _)| *a == arch)
+    .map(|(_, hash)| *hash)
+    .ok_or_else(|| crate::Error::ArchError(format!("No AppImage tools for architecture {arch}")))
+}
+
+/// Writes `url` to `path` unless a file there already matches `sha256` after
+/// `normalize`. Downloads are verified before `patch` runs and anything is written.
+fn ensure_tool(
+  path: &Path,
+  url: &str,
+  sha256: &str,
+  normalize: impl Fn(&mut Vec<u8>),
+  patch: impl Fn(&mut Vec<u8>),
+) -> crate::Result<()> {
+  if let Ok(mut cached) = fs::read(path) {
+    normalize(&mut cached);
+    if verify_hash(&cached, sha256, HashAlgorithm::Sha256).is_ok() {
+      return Ok(());
+    }
+    log::warn!(
+      "Cached {} doesn't match its expected hash. Downloading it again.",
+      path.display()
+    );
+  }
+  let mut data = download_and_verify(url, sha256, HashAlgorithm::Sha256)?;
+  patch(&mut data);
+  write_and_make_executable(path, &data)?;
+  Ok(())
+}
+
+fn prepare_tools(tools_path: &Path, arch: &str) -> crate::Result<Tools> {
+  ensure_tool(
+    &tools_path.join(format!("AppRun-{arch}")),
+    &format!(
+      "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-{arch}"
+    ),
+    sha256_for(APPRUN_SHA256, arch)?,
+    |_| {},
+    |_| {},
+  )?;
 
   let linuxdeploy_arch = if arch == "i686" { "i386" } else { arch };
   let linuxdeploy = tools_path.join(format!(
     "linuxdeploy-{LINUXDEPLOY_COMMIT_HASH}-{linuxdeploy_arch}.AppImage"
   ));
-  if !linuxdeploy.exists() {
-    let data = download(&format!(
+  ensure_tool(
+    &linuxdeploy,
+    &format!(
       "https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy-{LINUXDEPLOY_COMMIT_HASH}/linuxdeploy-{linuxdeploy_arch}.AppImage"
-    ))?;
-    write_and_make_executable(&linuxdeploy, &data)?;
-  }
+    ),
+    sha256_for(LINUXDEPLOY_SHA256, arch)?,
+    set_magic(APPIMAGE_MAGIC),
+    set_magic(&[0; 3]),
+  )?;
+
+  // linuxdeploy's built-in AppImage plugin otherwise downloads the runtime
+  // from the rolling `continuous` release.
+  let type2_runtime = tools_path.join(format!("runtime-{TYPE2_RUNTIME_RELEASE}-{arch}"));
+  ensure_tool(
+    &type2_runtime,
+    &format!(
+      "https://github.com/AppImage/type2-runtime/releases/download/{TYPE2_RUNTIME_RELEASE}/runtime-{arch}"
+    ),
+    sha256_for(TYPE2_RUNTIME_SHA256, arch)?,
+    |_| {},
+    |_| {},
+  )?;
 
   // The plugin scripts are embedded, so rewrite them whenever the cached copy differs:
   // a copy left behind by an older CLI would otherwise be used forever.
@@ -245,35 +372,8 @@ fn prepare_tools(tools_path: &Path, arch: &str, verbose: bool) -> crate::Result<
     }
   }
 
-  let appimage = tools_path.join("linuxdeploy-plugin-appimage.AppImage");
-  if !appimage.exists() {
-    // This is optional, linuxdeploy will fall back to its built-in version if the download failed.
-    // Since switching to linuxdeploy-07333c6 this shouldn't be necessary anymore, but we keep it here for now just for fun.
-    let data = download(&format!(
-      "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-{arch}.AppImage"
-    ));
-    match data {
-      Ok(data) => write_and_make_executable(&appimage, &data)?,
-      Err(err) => {
-        log::error!("Download of AppImage plugin failed. Using older built-in version instead.");
-        if verbose {
-          log::debug!("{err:?}");
-        }
-      }
-    }
-  }
-
-  // This should prevent linuxdeploy to be detected by appimage integration tools
-  let _ = Command::new("dd")
-    .args([
-      "if=/dev/zero",
-      "bs=1",
-      "count=3",
-      "seek=8",
-      "conv=notrunc",
-      &format!("of={}", linuxdeploy.display()),
-    ])
-    .output();
-
-  Ok(linuxdeploy)
+  Ok(Tools {
+    linuxdeploy,
+    type2_runtime,
+  })
 }
