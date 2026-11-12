@@ -170,7 +170,9 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
 
   let mut cmd = Command::new(&tools.linuxdeploy);
   cmd.env("OUTPUT", &appimage_path);
-  cmd.env("LDAI_RUNTIME_FILE", &tools.type2_runtime);
+  if let Some(runtime) = &tools.type2_runtime {
+    cmd.env("LDAI_RUNTIME_FILE", runtime);
+  }
   cmd.env("ARCH", tools_arch);
   // Looks like the cli arg isn't enough for the updated AppImage output-plugin.
   cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
@@ -271,7 +273,8 @@ const APPIMAGE_MAGIC: &[u8] = b"AI\x02";
 
 struct Tools {
   linuxdeploy: PathBuf,
-  type2_runtime: PathBuf,
+  /// `None` when the user provides their own runtime through `LDAI_RUNTIME_FILE`.
+  type2_runtime: Option<PathBuf>,
 }
 
 /// Returns a function that overwrites linuxdeploy's AppImage magic bytes.
@@ -349,17 +352,23 @@ fn prepare_tools(tools_path: &Path, arch: &str) -> crate::Result<Tools> {
   }
 
   // linuxdeploy's built-in AppImage plugin otherwise downloads the runtime
-  // from the rolling `continuous` release.
-  let type2_runtime = tools_path.join(format!("runtime-{TYPE2_RUNTIME_RELEASE}-{arch}"));
-  ensure_tool(
-    &type2_runtime,
-    &format!(
-      "https://github.com/AppImage/type2-runtime/releases/download/{TYPE2_RUNTIME_RELEASE}/runtime-{arch}"
-    ),
-    sha256_for(TYPE2_RUNTIME_SHA256, arch)?,
-    |_| {},
-    |_| {},
-  )?;
+  // from the rolling `continuous` release. A runtime the user provides through
+  // `LDAI_RUNTIME_FILE` is used as is.
+  let type2_runtime = if std::env::var_os("LDAI_RUNTIME_FILE").is_some() {
+    None
+  } else {
+    let path = tools_path.join(format!("runtime-{TYPE2_RUNTIME_RELEASE}-{arch}"));
+    ensure_tool(
+      &path,
+      &format!(
+        "https://github.com/AppImage/type2-runtime/releases/download/{TYPE2_RUNTIME_RELEASE}/runtime-{arch}"
+      ),
+      sha256_for(TYPE2_RUNTIME_SHA256, arch)?,
+      |_| {},
+      |_| {},
+    )?;
+    Some(path)
+  };
 
   // The plugin scripts are embedded, so rewrite them whenever the cached copy differs:
   // a copy left behind by an older CLI would otherwise be used forever.
