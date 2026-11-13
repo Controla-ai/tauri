@@ -71,7 +71,7 @@ pub fn bundle_project(settings: &Settings, updater: bool) -> crate::Result<Vec<P
     get_and_extract_wix(&wix_path)?;
   }
 
-  build_wix_app_installer(settings, &wix_path, updater)
+  build_wix_app_installer(settings, &tauri_tools_path, &wix_path, updater)
 }
 
 // For Cross Platform Compilation.
@@ -458,6 +458,7 @@ fn run_light(
 // Entry point for bundling and creating the MSI installer. For now the only supported platform is Windows x64.
 pub fn build_wix_app_installer(
   settings: &Settings,
+  tauri_tools_path: &Path,
   wix_toolset_path: &Path,
   updater: bool,
 ) -> crate::Result<Vec<PathBuf>> {
@@ -550,7 +551,7 @@ pub fn build_wix_app_installer(
       );
     }
     WebviewInstallMode::EmbedBootstrapper { silent: _ } => {
-      let webview2_bootstrapper_path = download_webview2_bootstrapper(&output_path)?;
+      let webview2_bootstrapper_path = download_webview2_bootstrapper(tauri_tools_path)?;
       data.insert(
         "webview2_bootstrapper_path",
         to_json(webview2_bootstrapper_path),
@@ -558,7 +559,7 @@ pub fn build_wix_app_installer(
     }
     WebviewInstallMode::OfflineInstaller { silent: _ } => {
       let webview2_installer_path =
-        download_webview2_offline_installer(&output_path.join(arch), arch)?;
+        download_webview2_offline_installer(&tauri_tools_path.join(arch), arch)?;
       data.insert("webview2_installer_path", to_json(webview2_installer_path));
     }
   }
