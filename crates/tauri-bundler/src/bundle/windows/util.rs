@@ -54,7 +54,7 @@ pub fn webview2_guid_path(url: &str) -> crate::Result<(String, String)> {
 pub fn download_webview2_bootstrapper(base_path: &Path) -> crate::Result<PathBuf> {
   let file_path = base_path.join("MicrosoftEdgeWebview2Setup.exe");
   if !file_path.exists() {
-    std::fs::write(&file_path, download(WEBVIEW2_BOOTSTRAPPER_URL)?)?;
+    write_atomically(&file_path, &download(WEBVIEW2_BOOTSTRAPPER_URL)?)?;
   }
   Ok(file_path)
 }
@@ -66,13 +66,35 @@ pub fn download_webview2_offline_installer(base_path: &Path, arch: &str) -> crat
     WEBVIEW2_OFFLINE_INSTALLER_X86_URL
   };
   let (guid, filename) = webview2_guid_path(url)?;
-  let dir_path = base_path.join(guid);
+  let dir_path = base_path.join(&guid);
   let file_path = dir_path.join(filename);
   if !file_path.exists() {
-    fs::create_dir_all(dir_path)?;
-    std::fs::write(&file_path, download(url)?)?;
+    // Each runtime release gets a new GUID. Only the current installer is used, and each is ~200 MB.
+    if base_path.exists() {
+      for entry in fs::read_dir(base_path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.file_name() != guid.as_str() {
+          fs::remove_dir_all(entry.path())?;
+        }
+      }
+    }
+    fs::create_dir_all(&dir_path)?;
+    write_atomically(&file_path, &download(url)?)?;
   }
   Ok(file_path)
+}
+
+/// Writes through a temporary file next to `path`, so an interrupted download doesn't leave a
+/// partial file that later builds would reuse.
+fn write_atomically(path: &Path, data: &[u8]) -> crate::Result<()> {
+  use std::io::Write as _;
+  let dir = path
+    .parent()
+    .expect("download paths have a parent directory");
+  let mut file = tempfile::NamedTempFile::new_in(dir)?;
+  file.write_all(data)?;
+  file.persist(path).map_err(|e| e.error)?;
+  Ok(())
 }
 
 /// Finds the Visual C++ runtime DLLs for the given architecture.
